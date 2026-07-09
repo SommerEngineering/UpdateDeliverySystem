@@ -11,12 +11,14 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+async-stream = "0.3"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 directories = "6"
 futures-util = "0.3"
+flexi_logger = { version = "0.31", default-features = false }
 hex = "0.4"
 inquire = "0.9"
 libc = "0.2"
