@@ -59,7 +59,7 @@ pub struct ConfigureServerArgs {
     pub config: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ClientCommand {
     /// Create or update the local client configuration.
     Configure,
@@ -79,6 +79,12 @@ pub enum ClientCommand {
     /// Show channel statistics.
     Stats,
 
+    /// Manage personal admin tokens using the break-glass owner token.
+    Tokens {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+
     /// Show UDS service logs.
     Logs {
         /// Follow appended log events.
@@ -97,6 +103,18 @@ pub enum ClientCommand {
         #[arg(long)]
         no_color: bool,
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum TokenCommand {
+    /// List token metadata and immutable status history.
+    List,
+    /// Create a personal or purpose-bound admin token.
+    Create,
+    /// Enable an admin token.
+    Enable { id: uuid::Uuid },
+    /// Disable an admin token.
+    Disable { id: uuid::Uuid },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
@@ -136,7 +154,7 @@ pub struct ServerConfig {
 
     pub public_base_url: String,
     pub data_dir: PathBuf,
-    pub admin_token: String,
+    pub owner_token_verifier: String,
 
     #[serde(default)]
     pub cluster_token: Option<String>,
@@ -437,12 +455,14 @@ impl UploadConfig {
 
 impl ServerConfig {
     pub async fn load(args: &ServerArgs) -> Result<Self> {
-        let mut config = if let Some(path) = &args.config {
-            let text = tokio::fs::read_to_string(path).await?;
-            toml::from_str::<ServerConfig>(&text)?
-        } else {
-            Self::development_default()
-        };
+        let path = args.config.as_ref().ok_or_else(|| {
+            UdsError::Config(
+                "server configuration is required; pass --config <path> or run 'uds server configure'"
+                    .to_string(),
+            )
+        })?;
+        let text = tokio::fs::read_to_string(path).await?;
+        let mut config = toml::from_str::<ServerConfig>(&text)?;
 
         if args.single_node_mode {
             config.mode = ServerMode::SingleNode;
@@ -452,7 +472,7 @@ impl ServerConfig {
         Ok(config)
     }
 
-    pub fn development_default() -> Self {
+    fn single_node_template() -> Self {
         Self {
             mode: ServerMode::SingleNode,
             public_api: ListenerConfig {
@@ -464,9 +484,9 @@ impl ServerConfig {
                 tls: TlsConfig::default(),
             },
             fleet_api: None,
-            public_base_url: "http://127.0.0.1:8080".to_string(),
-            data_dir: PathBuf::from("./uds-data"),
-            admin_token: "change-me-admin-token".to_string(),
+            public_base_url: "https://updates.example.org".to_string(),
+            data_dir: PathBuf::from("/var/lib/uds"),
+            owner_token_verifier: String::new(),
             cluster_token: None,
             channels: default_channels(),
             cluster: ClusterConfig::default(),
@@ -479,10 +499,17 @@ impl ServerConfig {
 
     /// Safe starting point for an interactively configured production server.
     pub fn production_single_node_default() -> Self {
-        let mut config = Self::development_default();
-        config.public_base_url = "https://updates.example.org".to_string();
-        config.data_dir = PathBuf::from("/var/lib/uds");
-        config.admin_token = String::new();
+        let mut config = Self::single_node_template();
+        config.cluster.node_id_path = config.data_dir.join("node-id");
+        config
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_default() -> Self {
+        let mut config = Self::single_node_template();
+        config.public_base_url = "http://127.0.0.1:8080".to_string();
+        config.data_dir = PathBuf::from("./uds-data");
+        config.owner_token_verifier = crate::auth::verifier("uds_owner_v1_test-only-owner-token");
         config.cluster.node_id_path = config.data_dir.join("node-id");
         config
     }
@@ -494,9 +521,10 @@ impl ServerConfig {
             ));
         }
 
-        if self.admin_token.len() < 16 {
+        if !valid_sha512_verifier(&self.owner_token_verifier) {
             return Err(UdsError::Config(
-                "admin_token must contain at least 16 characters".to_string(),
+                "owner_token_verifier must use the format sha512:<128 lowercase hex characters>"
+                    .to_string(),
             ));
         }
 
@@ -588,6 +616,15 @@ impl ServerConfig {
     pub fn channel_is_allowed(&self, channel: &str) -> bool {
         self.channels.contains(channel)
     }
+}
+
+fn valid_sha512_verifier(value: &str) -> bool {
+    value.strip_prefix("sha512:").is_some_and(|digest| {
+        digest.len() == 128 // 512 Bit -> 64 Bytes -> 128 Hex Chars
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 fn validate_tls(tls: &TlsConfig, name: &str) -> Result<()> {
@@ -775,6 +812,20 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn server_runtime_requires_an_explicit_config_file() {
+        let args = ServerArgs {
+            config: None,
+            single_node_mode: false,
+            command: None,
+        };
+        let error = ServerConfig::load(&args).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "configuration error: server configuration is required; pass --config <path> or run 'uds server configure'"
+        );
+    }
+
     #[test]
     fn old_root_level_server_options_are_rejected() {
         assert!(Cli::try_parse_from(["uds", "--single-node-mode"]).is_err());
@@ -795,7 +846,7 @@ mod tests {
 
     #[test]
     fn fleet_mode_requires_cluster_token() {
-        let mut config = ServerConfig::development_default();
+        let mut config = ServerConfig::test_default();
         config.mode = ServerMode::Fleet;
         config.cluster_token = None;
         let result = config.validate();
@@ -804,7 +855,7 @@ mod tests {
 
     #[test]
     fn fleet_api_matches_server_mode_and_rejects_wildcard_url() {
-        let mut config = ServerConfig::development_default();
+        let mut config = ServerConfig::test_default();
         config.fleet_api = Some(FleetApiConfig {
             bind: "10.20.0.12:8082".parse().unwrap(),
             fleet_base_url: "http://10.20.0.12:8082".into(),
@@ -838,7 +889,7 @@ mod tests {
 
     #[test]
     fn shutdown_defaults_to_five_minutes_and_rejects_zero() {
-        let mut config = ServerConfig::development_default();
+        let mut config = ServerConfig::test_default();
         assert_eq!(config.shutdown.grace_period_seconds, 300);
         config.shutdown.grace_period_seconds = 0;
         assert!(config.validate().is_err());
@@ -851,7 +902,7 @@ mod tests {
                 mode = "single-node"
                 public_base_url = "https://updates.example.org"
                 data_dir = "/var/lib/uds"
-                admin_token = "a-long-admin-token"
+                owner_token_verifier = "sha512:00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
 
                 [public_api]
                 bind = "127.0.0.1:8080"
